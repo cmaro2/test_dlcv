@@ -1,0 +1,100 @@
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+import torch
+import torch.autograd as autograd  # test purpose
+import torch.nn.functional as F
+from torchvision import models
+
+
+class PSPDec(nn.Module):
+	def __init__(self, in_features, out_features, downsize):
+		super().__init__()
+		self.downsize = downsize
+		self.conv = nn.Conv2d(in_features, out_features, 1, bias=False)
+		self.bn = nn.BatchNorm2d(out_features, momentum=.95)
+		self.relu = nn.ReLU(inplace=True)
+
+	def forward(self, x):
+		downsize = ( int(x.size()[2]/self.downsize[0]), int(x.size()[3]/self.downsize[1]) )
+		upsize = (x.size()[2], x.size()[3])
+
+		output = F.avg_pool2d(x, downsize, stride=downsize)
+		output = self.conv(output)
+		output = self.bn(output)
+		output = self.relu(output)
+		output = F.upsample_bilinear(output, upsize)
+		return output
+
+class myModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        resnet = models.resnet50(pretrained=True)
+
+        self.conv1 = resnet.conv1
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+            # m.stride = 1
+                m.requires_grad = False
+            if isinstance(m, nn.BatchNorm2d):
+                m.requires_grad = False
+
+        self.layer5a = PSPDec(2048, 128, (1,1))
+        self.layer5b = PSPDec(2048, 128, (2,2))
+        self.layer5c = PSPDec(2048, 128, (3,3))
+        self.layer5d = PSPDec(2048, 128, (6,6))
+
+        self.final = nn.Sequential(
+			nn.Conv2d(512+2048, 512, 3, padding=1, bias=False),
+			nn.BatchNorm2d(512, momentum=.95),
+			nn.ReLU(inplace=True),
+			nn.Dropout(.1),
+			nn.Conv2d(512, 9, 1),
+		)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = torch.cat([
+            self.layer5a(x),
+            self.layer5b(x),
+			self.layer5c(x),
+			self.layer5d(x),
+            x,
+    	], 1)
+        x = self.final(x)
+
+        x = F.upsample_bilinear(x, (352, 448) )
+        return x
+
+
+class myParallelModel(nn.Module):
+	def __init__(self, opt):
+		super().__init__()
+		self.opt = opt
+
+		self.model = myModel(opt)
+		self.model = nn.DataParallel(self.model, opt.GPUs)
+
+	def forward(self, x):
+		x = self.model(x)
+		return x
+
+
+def createModel(opt):
+	if opt.GPU:
+		if opt.nGPUs > 1:
+			model = myParallelModel(opt)
+		else:
+			model = myModel(opt)
+		model = model.cuda()
+	return model
